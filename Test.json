@@ -3,6 +3,6 @@
   "description": "",
   "manifestVersion": 1,
   "pluginLists": [
-    "https://raw.githubusercontent.com/SaurabhKaperwan/TestPlugins/builds/plugins.json"
+    "https://raw.githubusercontent.com/abod1232/test3/refs/heads/builds/plugins.json"
   ]
 }
