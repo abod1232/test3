@@ -1,4 +1,4 @@
-package com.megix
+package com.megixx
 
 import org.jsoup.nodes.Element
 import com.lagradost.cloudstream3.*
