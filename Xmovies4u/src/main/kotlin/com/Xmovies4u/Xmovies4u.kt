@@ -1,40 +1,174 @@
-package com.megixx
+package com.wecima // تم تصحيح اسم الحزمة
 
-import org.jsoup.nodes.Element
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.extractors.BigwarpIO
-import com.lagradost.cloudstream3.extractors.DoodLaExtractor
-import com.lagradost.cloudstream3.extractors.MixDrop
-import com.lagradost.cloudstream3.extractors.StreamTape
+import org.jsoup.nodes.Element
+import com.lagradost.cloudstream3.network.post
+import com.fasterxml.jackson.annotation.JsonProperty
+import android.util.Base64
 
-class Xmovies4u : MainAPI() {
-    override var mainUrl              = "https://xmoviesforyou.com"
-    override var name                 = "Xmovies4u"
-    override val hasMainPage          = true
-    override var lang                 = "en"
-    override val hasQuickSearch       = false
-    override val hasDownloadSupport   = true
-    override val supportedTypes       = setOf(TvType.NSFW)
-    override val vpnStatus            = VPNStatus.MightBeNeeded
+class WecimaProvider : MainAPI() {
+    override var mainUrl = "https://wecima.ac"
+    override var name = "We Cima"
+    override val hasMainPage = true
+    override var lang = "ar"
+    override val supportedTypes = setOf(
+        TvType.Movie,
+        TvType.TvSeries
+    )
 
     override val mainPage = mainPageOf(
-        "" to "Latest",
-        "/tag/onlyfans" to "Onlyfans",
-        "/tag/vixen" to "Vixen",
-        "/tag/tushy" to "Tushy",
-        "/tag/dorcelclub" to "Dorcelclub",
-        "/tag/deeper" to "Deeper",
-        "/tag/blackedraw" to "Blackedraw",
-        "/tag/blacked" to "Blacked",
-        "/tag/puretaboo" to "Puretaboo",
-        "/tag/sislovesme" to "Sislovesme",
-        "/tag/oopsfamily" to "Oopsfamily",
-        "/tag/familystrokes" to "Familystrokes",
+        "$mainUrl/seriestv" to "أحدث المسلسلات",
+        "$mainUrl/movies" to "أحدث الأفلام",
+        "$mainUrl/category/arabic-movies" to "أفلام عربي",
+        "$mainUrl/category/foreign-movies" to "أفلام أجنبي",
+        "$mainUrl/category/arabic-series" to "مسلسلات عربية",
+        "$mainUrl/category/foreign-series" to "مسلسلات أجنبية"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val document = app.get("$mainUrl${request.data}/page/$page").document
+        val document = app.get(request.data).document
+        val home = document.select("div.Grid--WecimaPosts div.GridItem").mapNotNull {
+            it.toSearchResult()
+        }
+        return newHomePageResponse(request.name, home)
+    }
+
+    private fun Element.toSearchResult(): SearchResponse? {
+        val titleElement = this.selectFirst("h2") ?: this.selectFirst("strong") ?: return null
+        val title = titleElement.text().trim()
+        val href = this.selectFirst("a")?.attr("href") ?: return null
+        val posterUrl = this.selectFirst("span.BG--GridItem")?.let {
+            val style = it.attr("style")
+            Regex("url\\((.*?)\\)").find(style)?.groupValues?.get(1)
+        } ?: this.selectFirst("span.BG--GridItem")?.attr("data-src")
+
+        return if (href.contains("/series/")) {
+            newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                this.posterUrl = posterUrl
+            }
+        } else {
+            newMovieSearchResponse(title, href, TvType.Movie) {
+                this.posterUrl = posterUrl
+            }
+        }
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        val url = "$mainUrl/search"
+        val response = app.post(
+            url,
+            data = mapOf("q" to query),
+            referer = "$mainUrl/"
+        ).parsed<SearchRoot>()
+
+        val html = response.output.joinToString("")
+        val document = org.jsoup.Jsoup.parse(html)
+
+        return document.select("div.GridItem").mapNotNull {
+            it.toSearchResult()
+        }
+    }
+
+    data class SearchRoot (
+        @JsonProperty("output" ) val output : ArrayList<String> = arrayListOf()
+    )
+
+    override suspend fun load(url: String): LoadResponse {
+        val document = app.get(url).document
+
+        val title = document.selectFirst("div.Title--Content--Single-begin h1")?.text()?.trim() ?: ""
+        val posterStyle = document.selectFirst("wecima.separated--top")?.attr("style")
+        val posterUrl = Regex("url\\((.*?)\\)").find(posterStyle ?: "")?.groupValues?.get(1)
+        val plot = document.selectFirst("div.StoryMovieContent")?.text()?.trim()
+        val year = document.select("ul.Terms--Content--Single-begin li")
+            .find { it.selectFirst("span")?.text()?.contains("السنة") == true }
+            ?.selectFirst("p")?.text()?.toIntOrNull()
+
+        val isMovie = !url.contains("/series/")
+
+        if (isMovie) {
+            return newMovieLoadResponse(title, url, TvType.Movie, url) {
+                this.posterUrl = posterUrl
+                this.plot = plot
+                this.year = year
+            }
+        } else {
+            val episodes = mutableListOf<Episode>()
+            val seasonElements = document.select("div.List--Seasons--Episodes a.SeasonsEpisodes")
+
+            if (seasonElements.isNotEmpty()) {
+                seasonElements.apmap { seasonEl ->
+                    val seasonNum = Regex("الموسم (\\d+)").find(seasonEl.text())?.groupValues?.get(1)?.toIntOrNull()
+                    val dataId = seasonEl.attr("data-id")
+                    val dataSeason = seasonEl.attr("data-season")
+
+                    val seasonPage = app.post(
+                        "$mainUrl/ajax/Episode",
+                        data = mapOf("post_id" to dataId, "season" to dataSeason)
+                    ).document
+
+                    seasonPage.select("a.hoverable.activable").forEach { epEl ->
+                        val epTitle = epEl.selectFirst("episodetitle")?.text() ?: ""
+                        val epNum = Regex("الحلقة (\\d+)").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+                        val epHref = epEl.attr("href")
+                        episodes.add(
+                            newEpisode(epHref) {
+                                name = epTitle
+                                season = seasonNum
+                                episode = epNum
+                            }
+                        )
+                    }
+                }
+            } else {
+                 document.select(".EpisodesList.Full--Width a").forEach { epEl ->
+                    val epTitle = epEl.selectFirst("episodetitle")?.text() ?: ""
+                    val epNum = Regex("الحلقة (\\d+)").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+                    val epHref = epEl.attr("href")
+                    episodes.add(
+                        newEpisode(epHref) {
+                            name = epTitle
+                            season = 1 // Default to season 1
+                            episode = epNum
+                        }
+                    )
+                }
+            }
+
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes.sortedBy { it.episode }) {
+                this.posterUrl = posterUrl
+                this.plot = plot
+                this.year = year
+            }
+        }
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val document = app.get(data).document
+
+        document.select("ul.WatchServersList li btn").apmap {
+            val encodedUrl = it.attr("data-url")
+            // Wecima's Base64 is a bit weird, manually fix it.
+            val fixedEncodedUrl = encodedUrl.replace(" ", "+")
+            try {
+                // The URL is plain Base64, but needs decoding.
+                val decodedUrl = String(Base64.decode(fixedEncodedUrl, Base64.DEFAULT))
+                if (decodedUrl.startsWith("http")) {
+                   loadExtractor(decodedUrl, mainUrl, subtitleCallback, callback)
+                }
+            } catch (e: Exception) {
+                logError(e)
+            }
+        }
+        return true
+    }
+}        val document = app.get("$mainUrl${request.data}/page/$page").document
         val home     = document.select("article.post").mapNotNull { it.toSearchResult() }
 
         return newHomePageResponse(
