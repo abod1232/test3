@@ -10,12 +10,12 @@
             "megix"
         ],
         "tvTypes": [
-            "NSFW"
+            "movie"
         ],
         "version": 1,
-        "internalName": "Xmovies4u",
+        "internalName": "anime3rb",
         "description": "",
         "url": "https://github.com/abod1232/test3/raw/refs/heads/builds/Anim3rb.cs3",
-        "name": "Xmovies4u"
+        "name": "anime3rb"
     }
 ]
