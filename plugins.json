@@ -1,21 +1,21 @@
 [
     {
-        "iconUrl": "https://xmoviesforyou.com/wp-content/uploads/2018/08/logo.png",
+        "iconUrl": "",
         "apiVersion": 1,
-        "repositoryUrl": "https://github.com/abod1232/test3",
+        "repositoryUrl": "https://github.com/Abodabodd/re-3arabi",
         "fileSize": 30203,
         "status": 1,
         "language": "en",
         "authors": [
-            "megix"
+            "Abodanodd"
         ],
         "tvTypes": [
             "movie"
         ],
         "version": 1,
-        "internalName": "anime3rb",
+        "internalName": "Cartoony",
         "description": "",
-        "url": "https://github.com/abod1232/test3/raw/refs/heads/builds/Anim3rb.cs3",
-        "name": "anime3rb"
+        "url": "https://github.com/Abodabodd/Testmyrepo/raw/refs/heads/main/Cartoony.cs3",
+        "name": "Cartoony"
     }
 ]
