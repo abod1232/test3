@@ -12,19 +12,22 @@ import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.PreferenceManager
 import androidx.preference.SwitchPreferenceCompat
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment
-import com.lagradost.cloudstream3.Actor
-import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
 import java.net.URLEncoder
 
 class CinemanaSettings : BottomSheetDialogFragment() {
@@ -58,30 +61,28 @@ class CinemanaSettings : BottomSheetDialogFragment() {
             val moviesCat = PreferenceCategory(context).apply { title = "الأفلام (ثابت)" }
             screen.addPreference(moviesCat)
 
-            val movieSwitches = listOf(
+            listOf(
                 Triple("أفلام - تاريخ الرفع - الأحدث", "cine_mov_upload_desc", false),
                 Triple("أفلام - تاريخ الرفع - الأقدم", "cine_mov_upload_asc", false),
                 Triple("أفلام - الأكثر مشاهدة", "cine_mov_views_desc", false),
                 Triple("أفلام - أعلى تقييم IMDb", "cine_mov_stars_desc", false),
                 Triple("أفلام - أبجديًا (أ-ي)", "cine_mov_ar_asc", false),
                 Triple("أفلام - أبجديًا (A-Z)", "cine_mov_en_asc", false)
-            )
-            movieSwitches.forEach { (title, key, def) ->
+            ).forEach { (title, key, def) ->
                 moviesCat.addPreference(createSwitch(title, key, def))
             }
 
             val seriesCat = PreferenceCategory(context).apply { title = "المسلسلات (ثابت)" }
             screen.addPreference(seriesCat)
 
-            val seriesSwitches = listOf(
+            listOf(
                 Triple("مسلسلات - تاريخ الرفع - الأحدث", "cine_ser_upload_desc", false),
                 Triple("مسلسلات - تاريخ الرفع - الأقدم", "cine_ser_upload_asc", false),
                 Triple("مسلسلات - الأكثر مشاهدة", "cine_ser_views_desc", false),
                 Triple("مسلسلات - أعلى تقييم IMDb", "cine_ser_stars_desc", false),
                 Triple("مسلسلات - أبجديًا (أ-ي)", "cine_ser_ar_asc", false),
                 Triple("مسلسلات - أبجديًا (A-Z)", "cine_ser_en_asc", false)
-            )
-            seriesSwitches.forEach { (title, key, def) ->
+            ).forEach { (title, key, def) ->
                 seriesCat.addPreference(createSwitch(title, key, def))
             }
         }
@@ -114,11 +115,31 @@ class Cinemana(val context: Context) : MainAPI() {
 
     private val apiV2 = "$mainUrl/api/android"
 
+    private val providerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = true
+        explicitNulls = false
+    }
+
+    @Volatile
+    private var cachedMainPage: List<MainPageData>? = null
+
+    @Volatile
+    private var dynamicRefreshRunning = false
+
     private data class Section(
         val title: String,
         val url: String,
         val prefKey: String,
         val defaultEnabled: Boolean = false
+    )
+
+    @Serializable
+    private data class CachedSection(
+        val title: String,
+        val url: String
     )
 
     private val staticCategories = listOf(
@@ -137,23 +158,115 @@ class Cinemana(val context: Context) : MainAPI() {
         Section("مسلسلات - أبجديًا (A-Z)", "$mainUrl/api/android/video/V/2?videoKind=2&langNb=&itemsPerPage=30&pageNumber=&level=0&sortParam=en_title_asc", "cine_ser_en_asc", false)
     )
 
+    private val fallbackDynamicCategories = listOf(
+        Section("أفلام 4K", "$apiV2/videoListPagination/groupID/290/level/0/itemsPerPage/12/page/", "cine_dynamic_home", true),
+        Section("أحدث الأفلام", "$apiV2/videoListPagination/groupID/26/level/0/itemsPerPage/12/page/", "cine_dynamic_home", true),
+        Section("أحدث المسلسلات", "$apiV2/videoListPagination/groupID/311/level/0/itemsPerPage/12/page/", "cine_dynamic_home", true),
+        Section("أفلام كارتون", "$apiV2/videoListPagination/groupID/392/level/0/itemsPerPage/12/page/", "cine_dynamic_home", true)
+    )
+
+    init {
+        warmDynamicSectionsCache()
+    }
+
     override val mainPage: List<MainPageData>
         get() {
+            cachedMainPage?.let { return it }
+
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
-            val generatedPages = mutableListOf<MainPageData>()
+            val pages = mutableListOf<MainPageData>()
 
             if (prefs.getBoolean("cine_banner", true) || prefs.getBoolean("cine_dynamic_home", true)) {
-                generatedPages.add(mainPageOf("CINE_DYNAMIC_HOME" to "الصفحة الرئيسية").first())
+                pages.add(mainPageOf("CINE_DYNAMIC_HOME" to "الصفحة الرئيسية").first())
+            }
+
+            if (prefs.getBoolean("cine_dynamic_home", true)) {
+                val dynamicSections = loadDynamicSectionsFromPrefs(prefs)
+                val sectionsToShow = if (dynamicSections.isNotEmpty()) dynamicSections else fallbackDynamicCategories
+
+                sectionsToShow.forEach { section ->
+                    pages.add(mainPageOf(section.url to section.title).first())
+                }
             }
 
             staticCategories.forEach { section ->
                 if (prefs.getBoolean(section.prefKey, section.defaultEnabled)) {
-                    generatedPages.add(mainPageOf(section.url to section.title).first())
+                    pages.add(mainPageOf(section.url to section.title).first())
                 }
             }
 
-            return generatedPages
+            cachedMainPage = pages
+            warmDynamicSectionsCache()
+            return pages
         }
+
+    private fun warmDynamicSectionsCache() {
+        if (dynamicRefreshRunning) return
+        dynamicRefreshRunning = true
+
+        providerScope.launch {
+            try {
+                val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+
+                val responseMap = withTimeoutOrNull(3000) {
+                    app.get("$apiV2/videoGroups/lang/ar/level/0")
+                        .parsedSafe<Map<String, Any>>()
+                } ?: return@launch
+
+                val groupsArray = responseMap["groups"] as? List<*> ?: return@launch
+
+                val newSections = mutableListOf<CachedSection>()
+
+                for (groupRaw in groupsArray) {
+                    val group = groupRaw as? Map<*, *> ?: continue
+                    val title = group["title"] as? String ?: continue
+
+                    val groupId = when (val rawId = group["groupsID"]) {
+                        is Number -> rawId.toInt().toString()
+                        is String -> rawId
+                        else -> null
+                    } ?: (group["analytics"] as? Map<*, *>)?.get("eventInt")?.toString()
+                        ?: group["list_id"]?.toString()
+                        ?: continue
+
+                    val paginationUrl = "$apiV2/videoListPagination/groupID/$groupId/level/0/itemsPerPage/12/page/"
+                    newSections.add(CachedSection(title, paginationUrl))
+                }
+
+                if (newSections.isNotEmpty()) {
+                    prefs.edit()
+                        .putString(
+                            "cine_dynamic_sections_cache",
+                            json.encodeToString(ListSerializer(CachedSection.serializer()), newSections)
+                        )
+                        .apply()
+
+                    cachedMainPage = null
+                }
+            } catch (e: Exception) {
+                Log.d(name, "Dynamic cache refresh failed: ${e.message}")
+            } finally {
+                dynamicRefreshRunning = false
+            }
+        }
+    }
+
+    private fun loadDynamicSectionsFromPrefs(prefs: android.content.SharedPreferences): List<Section> {
+        val raw = prefs.getString("cine_dynamic_sections_cache", null) ?: return emptyList()
+        return runCatching {
+            json.decodeFromString(
+                ListSerializer(CachedSection.serializer()),
+                raw
+            ).map {
+                Section(
+                    title = it.title,
+                    url = it.url,
+                    prefKey = "cine_dynamic_home",
+                    defaultEnabled = true
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = coroutineScope {
         val requestData = request.data ?: ""
@@ -170,99 +283,26 @@ class Cinemana(val context: Context) : MainAPI() {
                 return@coroutineScope newHomePageResponse(emptyList(), hasNext = false)
             }
 
-            val bannerDeferred = async(Dispatchers.IO) {
-                if (prefs.getBoolean("cine_banner", true)) {
-                    try {
-                        withTimeoutOrNull(3000) {
-                            app.get("$apiV2/banner/level/0").parsedSafe<List<Map<String, Any>>>()
-                        }
-                    } catch (_: Exception) {
-                        null
+            if (prefs.getBoolean("cine_banner", true)) {
+                val bannerResp = try {
+                    withTimeoutOrNull(3000) {
+                        app.get("$apiV2/banner/level/0").parsedSafe<List<Map<String, Any>>>()
                     }
-                } else null
-            }
-
-            val groupsDeferred = async(Dispatchers.IO) {
-                if (prefs.getBoolean("cine_dynamic_home", true)) {
-                    try {
-                        withTimeoutOrNull(3000) {
-                            app.get("$apiV2/videoGroups/lang/ar/level/0").parsedSafe<Map<String, Any>>()
-                        }
-                    } catch (_: Exception) {
-                        null
-                    }
-                } else null
-            }
-
-            bannerDeferred.await()?.mapNotNull { it.toCinemanaItem().toSearchResponse() }
-                ?.distinctBy { it.url }
-                ?.takeIf { it.isNotEmpty() }
-                ?.let { bannerList ->
-                    items.add(HomePageList("المميز", bannerList, isHorizontalImages = true))
+                } catch (_: Exception) {
+                    null
                 }
 
-            val responseMap = groupsDeferred.await()
-            val groupsArray = responseMap?.get("groups") as? List<*> ?: emptyList<Any>()
-            var addedAnyGroup = false
+                val parsedBanner = bannerResp
+                    ?.mapNotNull { it.toCinemanaItem().toSearchResponse() }
+                    ?.distinctBy { it.url }
+                    ?: emptyList()
 
-            for (groupRaw in groupsArray) {
-                val group = groupRaw as? Map<*, *> ?: continue
-                val title = group["title"] as? String ?: continue
-
-                val groupId = when (val rawId = group["groupsID"]) {
-                    is Number -> rawId.toInt().toString()
-                    else -> rawId?.toString()
-                } ?: (group["analytics"] as? Map<*, *>)?.get("eventInt")?.toString()
-                    ?: group["list_id"]?.toString()
-                    ?: continue
-
-                val paginationUrl = "$apiV2/videoListPagination/groupID/$groupId/level/0/itemsPerPage/12/page/"
-
-                val contentArray = group["content"] as? List<*> ?: emptyList<Any>()
-                val parsedContent = contentArray.mapNotNull { itemRaw ->
-                    (itemRaw as? Map<String, Any>)?.toCinemanaItem()?.toSearchResponse()
-                }.distinctBy { it.url }
-
-                if (parsedContent.isNotEmpty()) {
-                    val hpList = HomePageList(title, parsedContent)
-                    injectUrlToHomePageList(hpList, paginationUrl, title)
-                    items.add(hpList)
-                    addedAnyGroup = true
-                }
-            }
-
-            if (!addedAnyGroup) {
-                val fallbackSections = listOf(
-                    Section("أفلام 4K", "$apiV2/videoListPagination/groupID/290/level/0/itemsPerPage/12/page/", "cine_dynamic_home", true),
-                    Section("أحدث الأفلام", "$apiV2/videoListPagination/groupID/26/level/0/itemsPerPage/12/page/", "cine_dynamic_home", true),
-                    Section("أحدث المسلسلات", "$apiV2/videoListPagination/groupID/311/level/0/itemsPerPage/12/page/", "cine_dynamic_home", true),
-                    Section("أفلام كارتون", "$apiV2/videoListPagination/groupID/392/level/0/itemsPerPage/12/page/", "cine_dynamic_home", true)
-                )
-
-                for (section in fallbackSections) {
-                    try {
-                        val resp = withTimeoutOrNull(3000) {
-                            app.get("${section.url}0/").parsedSafe<List<Map<String, Any>>>()
-                        }
-                        val parsed = resp?.mapNotNull { it.toCinemanaItem().toSearchResponse() }
-                            ?.distinctBy { it.url }
-                            ?: emptyList()
-
-                        if (parsed.isNotEmpty()) {
-                            val hpList = HomePageList(section.title, parsed)
-                            injectUrlToHomePageList(hpList, section.url, section.title)
-                            items.add(hpList)
-                        }
-                    } catch (_: Exception) {
-                    }
+                if (parsedBanner.isNotEmpty()) {
+                    items.add(HomePageList("المميز", parsedBanner, isHorizontalImages = true))
                 }
             }
 
             return@coroutineScope newHomePageResponse(items, hasNext = false)
-        }
-
-        if (requestData == "CINE_DYNAMIC_HOME" && page > 1) {
-            return@coroutineScope newHomePageResponse(emptyList(), hasNext = false)
         }
 
         val apiPage = (page - 1).coerceAtLeast(0)
@@ -272,6 +312,7 @@ class Cinemana(val context: Context) : MainAPI() {
                 if (requestData.endsWith("/page/")) "$requestData$apiPage/"
                 else requestData.replace(Regex("/page/\\d+/?$"), "/page/$apiPage/")
             }
+
             requestData.contains("pageNumber=") -> {
                 val replaced = requestData.replace(Regex("pageNumber=\\d*"), "pageNumber=$apiPage")
                 if (replaced == requestData) {
@@ -279,6 +320,7 @@ class Cinemana(val context: Context) : MainAPI() {
                     else "$requestData?pageNumber=$apiPage"
                 } else replaced
             }
+
             else -> {
                 if (requestData.endsWith("/")) "$requestData$apiPage/"
                 else "$requestData/$apiPage/"
@@ -295,31 +337,18 @@ class Cinemana(val context: Context) : MainAPI() {
             null
         }
 
-        val parsed = resp?.mapNotNull { it.toCinemanaItem().toSearchResponse() }
+        val parsed = resp
+            ?.mapNotNull { it.toCinemanaItem().toSearchResponse() }
             ?.distinctBy { it.url }
             ?: emptyList()
 
         if (parsed.isNotEmpty()) {
             val hpList = HomePageList(requestName, parsed)
-            injectUrlToHomePageList(hpList, requestData, requestName)
             items.add(hpList)
         }
 
         val hasMore = parsed.size >= 12
         return@coroutineScope newHomePageResponse(items, hasNext = hasMore)
-    }
-
-    private fun injectUrlToHomePageList(hp: HomePageList, url: String, title: String) {
-        val candidateFieldNames = listOf("data", "requestData", "request", "pageUrl", "url", "extra", "nextPage", "params", "metadata")
-        for (fName in candidateFieldNames) {
-            try {
-                val f = hp.javaClass.getDeclaredField(fName)
-                f.isAccessible = true
-                f.set(hp, url)
-                return
-            } catch (_: Exception) {
-            }
-        }
     }
 
     override suspend fun search(query: String): List<SearchResponse>? {
@@ -339,7 +368,9 @@ class Cinemana(val context: Context) : MainAPI() {
         val (moviesRawAndParsed, seriesRawAndParsed) = listOf(moviesUrl, seriesUrl).map { url ->
             async(Dispatchers.IO) {
                 try {
-                    val rawResp = app.get(url).parsedSafe<List<Map<String, Any>>>()
+                    val rawResp = withTimeoutOrNull(4000) {
+                        app.get(url).parsedSafe<List<Map<String, Any>>>()
+                    }
                     val parsedItems = rawResp?.mapNotNull { it.toCinemanaItem().toSearchResponse() } ?: emptyList()
                     Pair(rawResp?.size ?: 0, parsedItems)
                 } catch (_: Exception) {
@@ -353,7 +384,6 @@ class Cinemana(val context: Context) : MainAPI() {
 
         val maxSize = maxOf(movies.size, series.size)
         val interleaved = ArrayList<SearchResponse>(movies.size + series.size)
-
         for (i in 0 until maxSize) {
             if (i < movies.size) interleaved.add(movies[i])
             if (i < series.size) interleaved.add(series[i])
@@ -363,11 +393,9 @@ class Cinemana(val context: Context) : MainAPI() {
             if (title.isNullOrBlank()) return 0
             val t = title.lowercase()
             val ql = q.lowercase().trim()
-
             if (t == ql) return 100
             if (t.startsWith(ql)) return 80
             if (t.contains(ql)) return 60
-
             val tokens = ql.split(Regex("\\s+")).filter { it.isNotBlank() }
             return 40 + tokens.count { t.contains(it) }
         }
@@ -634,7 +662,7 @@ class Cinemana(val context: Context) : MainAPI() {
 
     private fun CinemanaItem.toSearchResponse(): SearchResponse? {
         val validNb = nb ?: return null
-        val scoreObject = this.stars?.toFloatOrNull()?.let { Score.from10(it) }
+        val scoreObject = stars?.toFloatOrNull()?.let { Score.from10(it) }
         val finalTitle = arTitle?.takeIf { it.isNotBlank() } ?: enTitle ?: "بدون عنوان"
 
         return if (kind == 2) {
